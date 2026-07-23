@@ -1,0 +1,14 @@
+{
+  "api_base_url": "https://x8ki-letl-twmt.n7.xano.io/api:e2vHSaS4",
+  "endpoint": "/ativos",
+  "auth_header": "Authorization",
+  "auth_value": "Bearer SEU_TOKEN_AQUI",
+  "specs_field": "specs",
+  "timeout_seconds": 30,
+  "default_fields": {
+    "nome": "AUTO",
+    "tipo": "Computador",
+    "filial": "MATRIZ",
+    "status": "Ativo"
+  }
+}
