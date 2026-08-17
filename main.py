@@ -3,11 +3,21 @@ import platform
 import psutil
 import socket
 import uuid
-import requests
 import sys
 import os
+import struct
 from pathlib import Path
 from datetime import datetime
+import time
+
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
+try:
+    import socks
+    PYSOCKS_AVAILABLE = True
+except ImportError:
+    PYSOCKS_AVAILABLE = False
 
 try:
     import wmi
@@ -39,6 +49,74 @@ def safe_get(obj, attr, default="-"):
         return str(val) if val else default
     except:
         return default
+
+
+def get_system_proxy():
+    """Detecta proxy configurado no Windows (Internet Options)."""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+        enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+        if not enabled:
+            winreg.CloseKey(key)
+            return None
+        server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        winreg.CloseKey(key)
+        if not server:
+            return None
+        # Formato: "host:porta" ou "http=host1:port1;https=host2:port2"
+        if "=" in server:
+            for part in server.split(";"):
+                if part.startswith("http="):
+                    server = part.split("=", 1)[1]
+                    break
+        host, port = server.split(":")[0], int(server.split(":")[1])
+        print(f"[INFO] Proxy do sistema detectado: {host}:{port}")
+        return host, port
+    except Exception:
+        return None
+
+
+def _proxy_supports_connect(proxy_host, proxy_port):
+    """Verifica se o proxy suporta HTTP CONNECT tunneling (necessario para MongoDB)."""
+    if not PYSOCKS_AVAILABLE:
+        return False
+    try:
+        sock = socks.socksocket()
+        sock.set_proxy(socks.HTTP, proxy_host, proxy_port)
+        sock.settimeout(5)
+        sock.connect(("cluster0-shard-00-00.1lh3b.mongodb.net", 443))
+        sock.sendall(
+            b"CONNECT cluster0-shard-00-00.1lh3b.mongodb.net:443 HTTP/1.1\r\n"
+            b"Host: cluster0-shard-00-00.1lh3b.mongodb.net:443\r\n\r\n"
+        )
+        resp = sock.recv(256)
+        sock.close()
+        return b"200" in resp
+    except Exception:
+        return False
+
+
+def setup_proxy(proxy_host, proxy_port):
+    """Configura tunneling HTTP CONNECT via PySocks para todas as conexoes socket."""
+    if not PYSOCKS_AVAILABLE:
+        print("[AVISO] pysocks nao instalado, proxy ignorado")
+        return
+
+    def _proxy_create_connection(address, timeout=None, source_address=None):
+        host, port = address
+        sock = socks.socksocket()
+        sock.set_proxy(socks.HTTP, proxy_host, proxy_port)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect((host, port))
+        return sock
+
+    socket.create_connection = _proxy_create_connection
+    print(f"[INFO] Proxy configurado: {proxy_host}:{proxy_port}")
 
 
 def collect_machine_info():
@@ -253,49 +331,141 @@ def collect_machine_info():
     return info
 
 
-def send_to_api(config, machine_info):
-    """Envia as informações para a API Xano."""
-    url = f"{config['api_base_url'].rstrip('/')}{config['endpoint']}"
-    headers = {
-        "Content-Type": "application/json",
-        config.get("auth_header", "Authorization"): config.get("auth_value", "")
-    }
+def _rewrite_uri_to_port443(uri):
+    """Resolve SRV records de mongodb+srv:// e reescreve para mongodb:// na porta 443."""
+    import dns.resolver
+    import re
 
-    # Prepara payload - campo specs + campos adicionais
+    m = re.match(r"mongodb\+srv://(?:[^:]+:[^@]+@)?([^/?]+)", uri)
+    if not m:
+        return uri
+    hostname = m.group(1)
+
+    # Extrair user:pass se existir
+    cred_match = re.match(r"mongodb\+srv://([^:]+):([^@]+)@", uri)
+    user = cred_match.group(1) if cred_match else ""
+    password = cred_match.group(2) if cred_match else ""
+
+    # Extrair query string se existir
+    query_match = re.search(r"\?(.*)$", uri)
+    query = query_match.group(1) if query_match else ""
+
+    # Resolver SRV records
+    srv_records = dns.resolver.resolve(f"_mongodb._tcp.{hostname}", "SRV")
+    hosts = [f"{r.target.to_text().rstrip('.')}:443" for r in srv_records]
+
+    # Resolver TXT records para replica set
+    txt_records = dns.resolver.resolve(hostname, "TXT")
+    replica_set = None
+    auth_source = None
+    for r in txt_records:
+        for s in r.strings:
+            text = s.decode() if isinstance(s, bytes) else s
+            if text.startswith("replicaSet="):
+                replica_set = text.split("=", 1)[1]
+            elif text.startswith("authSource="):
+                auth_source = text.split("=", 1)[1]
+
+    # Montar nova URI
+    hosts_str = ",".join(hosts)
+    parts = [f"mongodb://{hosts_str}/"]
+    params = []
+    params.append("ssl=true")
+    if user and password:
+        parts = [f"mongodb://{user}:{password}@{hosts_str}/"]
+    if replica_set:
+        params.append(f"replicaSet={replica_set}")
+    if auth_source:
+        params.append(f"authSource={auth_source}")
+    if query:
+        params.append(query)
+
+    new_uri = parts[0] + "?" + "&".join(params) if params else parts[0]
+    print(f"[INFO] URI reescrita para porta 443: {hosts_str}")
+    return new_uri
+
+
+def _build_doc(machine_info, config):
+    """Monta o documento no formato esperado pela colecao."""
     specs_field = config.get("specs_field", "specs")
-    default_fields = config.get("default_fields", {})
-    
-    # Auto-preencher nome com hostname se configurado como "AUTO"
+    default_fields = dict(config.get("default_fields", {}))
+
     if default_fields.get("nome", "") == "AUTO":
         default_fields["nome"] = machine_info.get("hostname", "UNKNOWN")
-    
-    payload = {
-        specs_field: machine_info
-    }
-    # Adiciona campos extras (nome, tipo, filial, status)
-    payload.update(default_fields)
 
-    print(f"[INFO] Enviando para: {url}")
-    print(f"[INFO] Campo specs: {specs_field}")
-    print(f"[INFO] Campos extras: {list(default_fields.keys())}")
+    doc = {}
+    doc["created_at"] = int(time.time() * 1000)
+    doc.update(default_fields)
+    doc[specs_field] = machine_info
 
+    return doc
+
+
+def _try_insert(uri, db_name, collection_name, doc, timeout_ms):
+    """Tenta inserir no MongoDB. Retorna True se sucesso."""
+    client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=config.get("timeout_seconds", 30)
-        )
-        response.raise_for_status()
-        print(f"[SUCESSO] Resposta da API: {response.status_code}")
-        print(f"[SUCESSO] Resposta: {response.text}")
+        col = client[db_name][collection_name]
+        # Auto-incrementar campo "id"
+        last = col.find_one(sort=[("id", -1)])
+        doc["id"] = (last.get("id", 0) + 1) if last else 1
+        result = col.insert_one(doc)
+        doc["id"] = result.inserted_id
+        print(f"[SUCESSO] Documento inserido com ID: {result.inserted_id}")
         return True
-    except requests.exceptions.RequestException as e:
-        print(f"[ERRO] Falha ao enviar para API: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"[ERRO] Status: {e.response.status_code}")
-            print(f"[ERRO] Resposta: {e.response.text}")
-        return False
+    finally:
+        client.close()
+
+
+def send_to_mongodb(config, machine_info):
+    """Insere as informacoes da maquina no MongoDB Atlas.
+    
+    Estrategia:
+    1. Tenta conexao direta (funciona na maioria dos casos)
+    2. Se falhar e proxy suportar CONNECT, tenta via proxy na porta 443
+    3. Se proxy nao suportar CONNECT, reporta erro com instrucoes
+    """
+    uri = config["mongodb_uri"]
+    db_name = config["database"]
+    collection_name = config["collection"]
+    timeout_ms = config.get("timeout_ms", 30000)
+
+    print(f"[INFO] Conectando ao MongoDB: {db_name}.{collection_name}")
+
+    doc = _build_doc(machine_info, config)
+
+    # Salvar socket original antes de qualquer monkey-patch
+    _original_create_connection = socket.create_connection
+
+    # Estrategia 1: conexao direta (sem proxy)
+    print("[INFO] Tentativa 1: conexao direta...")
+    try:
+        if _try_insert(uri, db_name, collection_name, doc, timeout_ms):
+            return True
+    except Exception as e:
+        print(f"[AVISO] Conexao direta falhou: {type(e).__name__}")
+
+    # Estrategia 2: via proxy com CONNECT tunneling (porta 443)
+    proxy = get_system_proxy()
+    if proxy and PYSOCKS_AVAILABLE and _proxy_supports_connect(proxy[0], proxy[1]):
+        print(f"[INFO] Tentativa 2: via proxy {proxy[0]}:{proxy[1]} na porta 443...")
+        try:
+            setup_proxy(proxy[0], proxy[1])
+            uri_443 = _rewrite_uri_to_port443(uri)
+            if _try_insert(uri_443, db_name, collection_name, doc, timeout_ms):
+                return True
+        except Exception as e:
+            print(f"[AVISO] Via proxy falhou: {type(e).__name__}")
+        finally:
+            socket.create_connection = _original_create_connection
+    else:
+        if proxy:
+            print("[AVISO] Proxy nao suporta CONNECT tunneling para MongoDB")
+
+    print("[ERRO] Nao foi possivel conectar ao MongoDB Atlas")
+    print("[INFO] Verifique se a rede permite acesso a porta 27017 do Atlas")
+    print("[INFO] Ou adicione uma rota: route -p add 159.41.51.0 mask 255.255.255.0 GATEWAY")
+    return False
 
 
 def main():
@@ -312,14 +482,14 @@ def main():
     print("[INFO] Informações coletadas:")
     print(json.dumps(machine_info, indent=2, ensure_ascii=False))
 
-    print("[INFO] Enviando para API...")
-    success = send_to_api(config, machine_info)
+    print("[INFO] Enviando para MongoDB Atlas...")
+    success = send_to_mongodb(config, machine_info)
 
     if success:
         print("\n[SUCESSO] Coleta e envio concluídos com sucesso!")
         sys.exit(0)
     else:
-        print("\n[FALHA] Erro ao enviar dados para a API.")
+        print("\n[FALHA] Erro ao enviar dados para o MongoDB.")
         sys.exit(1)
 
 

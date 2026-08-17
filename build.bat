@@ -20,7 +20,6 @@ echo [3/4] Compilando com PyInstaller...
 pyinstaller --onefile --name coletor_maquina ^
     --add-data "config.json;." ^
     --hidden-import psutil ^
-    --hidden-import requests ^
     --hidden-import psutil._psutil_windows ^
     --hidden-import psutil._psutil_linux ^
     --hidden-import psutil._psutil_osx ^
@@ -29,6 +28,9 @@ pyinstaller --onefile --name coletor_maquina ^
     --hidden-import platform ^
     --hidden-import json ^
     --hidden-import datetime ^
+    --hidden-import pymongo ^
+    --hidden-import dns ^
+    --hidden-import dns.resolver ^
     main.py
 
 echo.
@@ -40,12 +42,12 @@ if exist "dist\coletor_maquina.exe" (
     echo ========================================
     echo.
     echo Executavel: dist\coletor_maquina.exe
-    echo Config:     dist\config.json  (copie e edite)
+    echo Config:     dist\config.json - copie e edite
     echo.
     echo Para testar:
     echo   cd dist
     echo   copy ..\config.json .
-    echo   edite config.json com sua URL/token Xano
+    echo   edite config.json com sua URI do MongoDB Atlas
     echo   coletor_maquina.exe
 ) else (
     echo.
